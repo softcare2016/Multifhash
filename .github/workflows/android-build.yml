@@ -3,7 +3,9 @@ name: Universal Multi Flashing Tool - Android Build
 
 on:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
     paths:
       - '**/*.zip'
       - '**/*.yml'
@@ -34,51 +36,98 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # Android SDK setup - FIXED
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
       - name: Install Android SDK packages
-        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "platform-tools"
+
+      - name: Verify Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --list_installed
+          adb version
 
       - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
+      # Find and extract Android project
       - name: Find and recursively extract Android project ZIP
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
-          import os, sys, zipfile, hashlib
+          import os
+          import sys
+          import zipfile
+          import hashlib
           from pathlib import Path
 
           repo = Path(os.environ['GITHUB_WORKSPACE']).resolve()
           temp = Path(os.environ['RUNNER_TEMP']) / 'umt-recursive-extract'
           temp.mkdir(parents=True, exist_ok=True)
+
           max_depth = 10
           max_archives = 100
           seen = set()
 
-          def is_project(root: Path):
-              for settings in list(root.rglob('settings.gradle.kts')) + list(root.rglob('settings.gradle')):
+          def is_project(root):
+              settings_files = (
+                  list(root.rglob('settings.gradle.kts')) +
+                  list(root.rglob('settings.gradle'))
+              )
+
+              for settings in settings_files:
                   project = settings.parent
-                  if ((project / 'app' / 'build.gradle.kts').is_file()
-                      or (project / 'app' / 'build.gradle').is_file()):
+
+                  has_app = (
+                      (project / 'app' / 'build.gradle.kts').is_file()
+                      or
+                      (project / 'app' / 'build.gradle').is_file()
+                  )
+
+                  if has_app:
                       return project
+
               return None
 
+          # First check normal project folders.
           project = is_project(repo)
 
           if project:
-              print(f'Found Android project directly in repository: {project}')
+              print('Android project found directly in repository.')
+
           else:
-              queue = sorted(p for p in repo.rglob('*.zip')
-                             if '.git' not in p.parts and ' .gradle' not in p.parts)
+              queue = sorted(
+                  p for p in repo.rglob('*.zip')
+                  if '.git' not in p.parts
+                  and '.gradle' not in p.parts
+              )
+
               processed = 0
               level = 0
 
-              while queue and level < max_depth and processed < max_archives and not project:
+              while (
+                  queue
+                  and level < max_depth
+                  and processed < max_archives
+                  and not project
+              ):
                   next_queue = []
 
                   for archive in queue:
@@ -95,70 +144,118 @@ jobs:
                           seen.add(digest)
 
                           with zipfile.ZipFile(archive) as zf:
+
                               bad = zf.testzip()
 
                               if bad:
-                                  print(f'Skipping damaged ZIP {archive}: {bad}')
+                                  print('Damaged ZIP:', archive)
                                   continue
 
-                              target = temp / f'level-{level}' / digest[:16]
-                              target.mkdir(parents=True, exist_ok=True)
+                              target = (
+                                  temp /
+                                  f'level-{level}' /
+                                  digest[:16]
+                              )
 
+                              target.mkdir(
+                                  parents=True,
+                                  exist_ok=True
+                              )
+
+                              # ZIP path traversal protection.
                               for info in zf.infolist():
-                                  dest = (target / info.filename).resolve()
+                                  dest = (
+                                      target / info.filename
+                                  ).resolve()
 
-                                  if dest != target.resolve() and target.resolve() not in dest.parents:
-                                      raise RuntimeError(f'Unsafe ZIP path: {info.filename}')
+                                  if (
+                                      dest != target.resolve()
+                                      and target.resolve() not in dest.parents
+                                  ):
+                                      raise RuntimeError(
+                                          'Unsafe ZIP path: '
+                                          + info.filename
+                                      )
 
                               zf.extractall(target)
 
                           processed += 1
-                          print(f'Extracted archive level {level}: {archive}')
+
+                          print(
+                              f'Extracted level {level}: {archive.name}'
+                          )
 
                           project = is_project(target)
 
                           if project:
                               break
 
-                          next_queue.extend(target.rglob('*.zip'))
+                          next_queue.extend(
+                              target.rglob('*.zip')
+                          )
 
                       except Exception as exc:
-                          print(f'WARNING: Could not process {archive}: {exc}')
+                          print(
+                              f'WARNING: {archive}: {exc}'
+                          )
 
                   queue = next_queue
                   level += 1
 
           if not project:
-              print('ERROR: Could not find a valid Android Gradle project.')
-              print('Expected settings.gradle(.kts) and app/build.gradle(.kts).')
-              print('Repository ZIP files:')
+              print('ERROR: Android Gradle project not found.')
+              print(
+                  'Expected settings.gradle(.kts) and '
+                  'app/build.gradle(.kts).'
+              )
+
+              print('Available ZIP files:')
 
               for p in repo.rglob('*.zip'):
                   if '.git' not in p.parts:
-                      print(' -', p.relative_to(repo))
+                      print(p.relative_to(repo))
 
               sys.exit(1)
 
           project = project.resolve()
 
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+          with open(
+              os.environ['GITHUB_ENV'],
+              'a',
+              encoding='utf-8'
+          ) as env:
               env.write(f'PROJECT_DIR={project}\n')
 
-          print(f'PROJECT_DIR={project}')
+          print('Android project found:', project)
+
           PY
 
+      # Verify project
       - name: Verify Android project configuration
         shell: bash
         run: |
           set -euo pipefail
+
           cd "$PROJECT_DIR"
 
-          test -f settings.gradle.kts || test -f settings.gradle
-          test -f app/build.gradle.kts || test -f app/build.gradle
-          test -f gradle.properties
+          if [[ ! -f settings.gradle.kts && ! -f settings.gradle ]]; then
+            echo "ERROR: Gradle settings file not found."
+            exit 1
+          fi
 
-          echo "Android project structure verified: $PROJECT_DIR"
+          if [[ ! -f app/build.gradle.kts && ! -f app/build.gradle ]]; then
+            echo "ERROR: Android app module not found."
+            exit 1
+          fi
 
+          if [[ ! -f gradle.properties ]]; then
+            echo "WARNING: gradle.properties not found."
+          fi
+
+          echo "Android project configuration verified."
+          echo "Project directory: $PROJECT_DIR"
+
+      # Screen layout verification
       - name: Run screen layout verification
         shell: bash
         run: |
@@ -167,15 +264,37 @@ jobs:
           if [[ -f "$PROJECT_DIR/tools/simulation/check_screen_layout.sh" ]]; then
             bash "$PROJECT_DIR/tools/simulation/check_screen_layout.sh"
           else
-            echo "Screen layout verification script not found; skipping."
+            echo "Screen layout verification script not found."
+            echo "Skipping optional verification."
           fi
 
+      # Unit tests
       - name: Run unit tests
-        run: gradle -p "$PROJECT_DIR" testDebugUnitTest --no-daemon --stacktrace --max-workers=2
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          cd "$PROJECT_DIR"
+
+          gradle testDebugUnitTest \
+            --no-daemon \
+            --stacktrace \
+            --max-workers=2
+
+      # Build APK
       - name: Build debug APK
-        run: gradle -p "$PROJECT_DIR" assembleDebug --no-daemon --stacktrace --max-workers=2
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          cd "$PROJECT_DIR"
+
+          gradle assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --max-workers=2
+
+      # Verify APK
       - name: Verify generated APK
         shell: bash
         run: |
@@ -183,12 +302,22 @@ jobs:
 
           APK_DIR="$PROJECT_DIR/app/build/outputs/apk/debug"
 
-          test -d "$APK_DIR"
+          if [[ ! -d "$APK_DIR" ]]; then
+            echo "ERROR: APK output directory not found."
+            exit 1
+          fi
 
-          find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' -print -quit | grep -q .
+          APK_COUNT=$(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' | wc -l)
 
+          if [[ "$APK_COUNT" -eq 0 ]]; then
+            echo "ERROR: No APK generated."
+            exit 1
+          fi
+
+          echo "APK generated successfully:"
           ls -lh "$APK_DIR"/*.apk
 
+      # Upload APK
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
@@ -197,6 +326,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # Diagnostics
       - name: Upload build diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
