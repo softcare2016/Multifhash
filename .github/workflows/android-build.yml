@@ -1,322 +1,206 @@
-
 name: Universal Multi Flashing Tool - Android Build
 
 on:
-  push:
-    branches:
-      - main
-      - master
-  workflow_dispatch:
+push:
+branches:
+- main
+- master
+workflow_dispatch:
 
 permissions:
-  contents: read
-
-concurrency:
-  group: android-build-${{ github.ref }}
-  cancel-in-progress: false
+contents: read
 
 jobs:
-  build:
-    name: Build Android APK
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-      GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx3g -Dfile.encoding=UTF-8"
-
-    steps:
-      # 1. Checkout
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      # 2. Find latest ZIP regardless of filename
-      - name: Find and Extract Latest Project ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Searching for project ZIP files..."
-
-          ZIP_FILE=$(find . \
-            -type f \
-            -iname "*.zip" \
-            -not -path "./.git/*" \
-            -not -path "./.github/*" \
-            -printf '%T@ %p\n' \
-            | sort -nr \
-            | head -n 1 \
-            | cut -d' ' -f2-)
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP file found."
-            exit 1
-          fi
-
-          echo "Selected ZIP: $ZIP_FILE"
-
-          PROJECT_ROOT="$RUNNER_TEMP/android-project"
-
-          mkdir -p "$PROJECT_ROOT"
-
-          unzip -q "$ZIP_FILE" -d "$PROJECT_ROOT"
-
-          echo "ZIP extraction completed."
-
-          PROJECT_FILE=$(find "$PROJECT_ROOT" \
-            -type f \
-            \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
-            | head -n 1)
-
-          if [ -z "$PROJECT_FILE" ]; then
-            echo "ERROR: Gradle settings file not found."
-            exit 1
-          fi
-
-          PROJECT_DIR=$(dirname "$PROJECT_FILE")
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          echo "Detected project: $PROJECT_DIR"
-
-      # 3. Java 17
-      - name: Set Up Java 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      # 4. Android SDK
-      - name: Locate Android SDK Tools
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ ! -d "$ANDROID_HOME" ]; then
-            echo "ERROR: Android SDK directory not found."
-            exit 1
-          fi
-
-          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f \
-            -name sdkmanager \
-            | head -n 1)
-
-          if [ -z "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager not found."
-            exit 1
-          fi
-
-          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-
-          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
-
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
-
-          echo "Android SDK tools located."
-
-      # 5. Android licenses
-      - name: Accept Android SDK Licenses
-        shell: bash
-        run: |
-          set -e
-
-          yes | "$SDKMANAGER" --licenses || true
-
-      # 6. Install SDK packages
-      - name: Install Android SDK Packages
-        shell: bash
-        run: |
-          set -e
-
-          "$SDKMANAGER" --install \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
-
-      # 7. Gradle
-      - name: Set Up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.9"
-
-      # 8. Configure dependency repositories
-      - name: Configure Gradle Repositories
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$HOME/.gradle/init.d"
-
-          cat > "$HOME/.gradle/init.d/android-repositories.gradle" <<'EOF'
-          beforeSettings { settings ->
-              settings.pluginManagement.repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-
-          allprojects {
-              buildscript.repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-          EOF
-
-          echo "Gradle repository configuration installed."
-
-      # 9. Verify project
-      - name: Verify Android Project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$PROJECT_DIR"
-
-          echo "Verifying Android project..."
-
-          if [ ! -f "settings.gradle.kts" ] && \
-             [ ! -f "settings.gradle" ]; then
-            echo "ERROR: Settings file missing."
-            exit 1
-          fi
-
-          if [ ! -f "build.gradle.kts" ] && \
-             [ ! -f "build.gradle" ]; then
-            echo "ERROR: Root build file missing."
-            exit 1
-          fi
-
-          if [ ! -f "app/build.gradle.kts" ] && \
-             [ ! -f "app/build.gradle" ]; then
-            echo "ERROR: App module build file missing."
-            exit 1
-          fi
-
-          echo "Project verification successful."
-
-      # 10. Run unit tests with retry
-      - name: Run Unit Tests
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          cd "$PROJECT_DIR"
-
-          gradle --version
-
-          for attempt in 1 2 3; do
-
-            echo "Unit test attempt: $attempt"
-
-            if gradle testDebugUnitTest \
-              --no-daemon \
-              --stacktrace \
-              --refresh-dependencies \
-              --max-workers=2; then
-
-              echo "Unit tests completed successfully."
-              exit 0
-            fi
-
-            if [ "$attempt" -lt 3 ]; then
-              echo "Retrying after dependency/build failure..."
-              sleep $((attempt * 15))
-            fi
-
-          done
-
-          echo "ERROR: Unit tests failed after 3 attempts."
-          exit 1
-
-      # 11. Build APK with retry
-      - name: Build Debug APK
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          cd "$PROJECT_DIR"
-
-          for attempt in 1 2 3; do
-
-            echo "APK build attempt: $attempt"
-
-            if gradle assembleDebug \
-              --no-daemon \
-              --stacktrace \
-              --max-workers=2; then
-
-              echo "APK build successful."
-              exit 0
-            fi
-
-            if [ "$attempt" -lt 3 ]; then
-              echo "Retrying APK build..."
-              sleep $((attempt * 15))
-            fi
-
-          done
-
-          echo "ERROR: APK build failed after 3 attempts."
-          exit 1
-
-      # 12. Verify APK
-      - name: Verify APK Output
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APK_DIR="$PROJECT_DIR/app/build/outputs/apk/debug"
-
-          if [ ! -d "$APK_DIR" ]; then
-            echo "ERROR: APK output directory missing."
-            exit 1
-          fi
-
-          APK_COUNT=$(find "$APK_DIR" -maxdepth 1 \
-            -type f -name "*.apk" | wc -l)
-
-          if [ "$APK_COUNT" -eq 0 ]; then
-            echo "ERROR: No APK generated."
-            exit 1
-          fi
-
-          echo "Generated APK files:"
-          find "$APK_DIR" -maxdepth 1 -type f -name "*.apk" -print
-
-      # 13. Upload APK
-      - name: Upload APK
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Universal-Multi-Flashing-Tool-APK
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-          retention-days: 14
-
-      # 14. Upload test reports
-      - name: Upload Test Reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Android-Test-Reports
-          path: |
-            ${{ env.PROJECT_DIR }}/app/build/reports/tests/
-          if-no-files-found: ignore
-          retention-days: 7
-
-      # 15. Upload diagnostic logs
-      - name: Upload Gradle Diagnostic Logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Android-Build-Diagnostic-Logs
-          path: |
-            /home/runner/.gradle/daemon/
-            ${{ env.PROJECT_DIR }}/app/build/reports/
-          if-no-files-found: ignore
-          retention-days: 7
+build:
+name: Build Android APK
+runs-on: ubuntu-latest
+
+env:  
+  ANDROID_HOME: /usr/local/lib/android/sdk  
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk  
+
+steps:  
+  - name: Checkout Repository  
+    uses: actions/checkout@v4  
+
+  # Find the latest ZIP, regardless of its filename  
+  - name: Find and Extract Latest Project ZIP  
+    shell: bash  
+    run: |  
+      set -e  
+
+      echo "Searching for ZIP files..."  
+
+      ZIP_FILE=$(find . \  
+        -type f \  
+        -iname "*.zip" \  
+        -not -path "./.git/*" \  
+        -not -path "./.github/*" \  
+        -printf '%T@ %p\n' \  
+        | sort -nr \  
+        | head -n 1 \  
+        | cut -d' ' -f2-)  
+
+      if [ -z "$ZIP_FILE" ]; then  
+        echo "ERROR: No ZIP file found."  
+        exit 1  
+      fi  
+
+      echo "Selected ZIP: $ZIP_FILE"  
+
+      mkdir -p "$RUNNER_TEMP/android-project"  
+
+      unzip -q "$ZIP_FILE" \  
+        -d "$RUNNER_TEMP/android-project"  
+
+      echo "ZIP extraction completed."  
+
+      PROJECT_FILE=$(find "$RUNNER_TEMP/android-project" \  
+        -type f \  
+        -name "settings.gradle.kts" -o -name "settings.gradle" \  
+        | head -n 1)  
+
+      if [ -z "$PROJECT_FILE" ]; then  
+        echo "ERROR: Gradle settings file not found."  
+        exit 1  
+      fi  
+
+      PROJECT_DIR=$(dirname "$PROJECT_FILE")  
+
+      echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"  
+
+      echo "Detected project: $PROJECT_DIR"  
+
+  # Java 17  
+  - name: Set Up Java 17  
+    uses: actions/setup-java@v5  
+    with:  
+      distribution: temurin  
+      java-version: "17"  
+
+  # Android SDK  
+  - name: Locate Android SDK Tools  
+    shell: bash  
+    run: |  
+      set -e  
+
+      if [ ! -d "$ANDROID_HOME" ]; then  
+        echo "ERROR: Android SDK directory not found."  
+        exit 1  
+      fi  
+
+      SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \  
+        -type f \  
+        -name sdkmanager \  
+        | head -n 1)  
+
+      if [ -z "$SDKMANAGER" ]; then  
+        echo "ERROR: sdkmanager not found."  
+        exit 1  
+      fi  
+
+      echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"  
+      echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"  
+      echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"  
+
+      echo "Android SDK tools located."  
+
+  - name: Accept Android SDK Licenses  
+    shell: bash  
+    run: |  
+      set -e  
+      yes | "$SDKMANAGER" --licenses || true  
+
+  - name: Install Android SDK Packages  
+    shell: bash  
+    run: |  
+      set -e  
+
+      "$SDKMANAGER" --install \  
+        "platform-tools" \  
+        "platforms;android-35" \  
+        "build-tools;35.0.0"  
+
+  # Gradle 8.9  
+  - name: Set Up Gradle  
+    uses: gradle/actions/setup-gradle@v4  
+    with:  
+      gradle-version: "8.9"  
+
+  # Verify project without requiring gradlew  
+  - name: Verify Android Project  
+    shell: bash  
+    run: |  
+      set -e  
+
+      cd "$PROJECT_DIR"  
+
+      echo "Verifying Android project..."  
+
+      if [ ! -f "settings.gradle.kts" ] && \  
+         [ ! -f "settings.gradle" ]; then  
+        echo "ERROR: Gradle settings file missing."  
+        exit 1  
+      fi  
+
+      if [ ! -f "build.gradle.kts" ] && \  
+         [ ! -f "build.gradle" ]; then  
+        echo "ERROR: Root Gradle build file missing."  
+        exit 1  
+      fi  
+
+      if [ ! -f "app/build.gradle.kts" ] && \  
+         [ ! -f "app/build.gradle" ]; then  
+        echo "ERROR: App module build file missing."  
+        exit 1  
+      fi  
+
+      echo "Gradle wrapper is optional."  
+      echo "Using installed Gradle instead."  
+      echo "Project verification successful."  
+
+  # Run tests using installed Gradle  
+  - name: Run Unit Tests  
+    shell: bash  
+    run: |  
+      set -e  
+
+      cd "$PROJECT_DIR"  
+
+      gradle --version  
+
+      gradle testDebugUnitTest \  
+        --no-daemon \  
+        --stacktrace  
+
+  # Build APK using installed Gradle  
+  - name: Build Debug APK  
+    shell: bash  
+    run: |  
+      set -e  
+
+      cd "$PROJECT_DIR"  
+
+      gradle assembleDebug \  
+        --no-daemon \  
+        --stacktrace  
+
+  # Upload APK  
+  - name: Upload APK  
+    if: success()  
+    uses: actions/upload-artifact@v4  
+    with:  
+      name: Universal-Multi-Flashing-Tool-APK  
+      path: |  
+        ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk  
+      if-no-files-found: error  
+
+  # Upload test reports  
+  - name: Upload Test Reports  
+    if: always()  
+    uses: actions/upload-artifact@v4  
+    with:  
+      name: Android-Test-Reports  
+      path: |  
+        ${{ env.PROJECT_DIR }}/app/build/reports/tests/  
+      if-no-files-found: ignore
