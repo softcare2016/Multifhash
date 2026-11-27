@@ -1,4 +1,5 @@
-name: Universal Multi Flashing Tool - Android Build
+
+name: Universal Multi Flashing Tool Build
 
 on:
   push:
@@ -23,62 +24,80 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Build Tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip zip
+      - name: Install Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
 
-      - name: Find and Extract Project ZIP
+      - name: Find and Extract ZIP
+        shell: bash
         run: |
-          ZIP_FILE=$(find . -type f -iname "*.zip" | head -n 1)
+          ZIP_FILE=$(find . -maxdepth 2 -type f -iname "*.zip" \
+            ! -path "./.git/*" | head -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP file found!"
+            echo "ERROR: No project ZIP found!"
             exit 1
           fi
 
-          echo "Found ZIP: $ZIP_FILE"
+          echo "Found: $ZIP_FILE"
 
           mkdir -p extracted
           unzip -q "$ZIP_FILE" -d extracted
 
-          echo "ZIP extracted successfully."
+          echo "Extraction successful!"
 
       - name: Locate Android Project
+        shell: bash
         run: |
-          GRADLE_FILE=$(find extracted -name settings.gradle.kts -o -name settings.gradle | head -n 1)
+          GRADLE_FILE=$(find extracted \
+            \( -name settings.gradle.kts -o -name settings.gradle \) \
+            -print -quit)
 
           if [ -z "$GRADLE_FILE" ]; then
-            echo "ERROR: Android Gradle project not found!"
+            echo "ERROR: Android project not found!"
             exit 1
           fi
 
           PROJECT_DIR=$(dirname "$GRADLE_FILE")
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          echo "Project found: $PROJECT_DIR"
+          echo "Project: $PROJECT_DIR"
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Build Debug APK
+        shell: bash
         run: |
-          cd "$PROJECT_DIR"
-          chmod +x gradlew 2>/dev/null || true
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager -print -quit)
 
-          if [ -f gradlew ]; then
-            ./gradlew assembleDebug
-          else
-            echo "ERROR: Gradle wrapper missing!"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: SDK Manager not found!"
             exit 1
           fi
 
-      - name: Upload APK Artifact
+          yes | "$SDKMANAGER" --licenses || true
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Generate Gradle Wrapper
+        run: |
+          cd "$PROJECT_DIR"
+          gradle wrapper --gradle-version 8.9
+
+      - name: Build Android APK
+        run: |
+          cd "$PROJECT_DIR"
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Universal-Multi-Flashing-Tool-APK
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 30
-          
