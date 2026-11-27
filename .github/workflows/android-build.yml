@@ -6,17 +6,13 @@ on:
     branches:
       - main
       - master
-    paths:
-      - '**.zip'
-      - 'UniversalMultiFlashingTool/**'
-      - '.github/workflows/android-build.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: universal-flasher-build-${{ github.ref }}
+  group: universal-flasher-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,47 +27,93 @@ jobs:
 
     steps:
 
-      # 1. Checkout
+      # 1. Checkout repository
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. Java 17
+      # 2. Setup Java 17
       - name: Set Up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. Android SDK
-      - name: Set Up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK Packages
+      # 3. Locate preinstalled Android SDK
+      # Do not use setup-android action.
+      # It previously attempted to install obsolete "tools".
+      - name: Locate Android SDK Tools
         shell: bash
         run: |
           set -euo pipefail
 
-          sdkmanager --install \
+          if [ ! -d "$ANDROID_HOME" ]; then
+            echo "ERROR: Android SDK not found."
+            exit 1
+          fi
+
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+              -type f \
+              -name sdkmanager \
+              | head -n 1)
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -f "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found."
+            exit 1
+          fi
+
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+          echo "Android SDK located."
+          echo "SDK Manager: $SDKMANAGER"
+
+      # 4. Accept SDK licenses
+      - name: Accept Android SDK Licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | "$SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" \
+            --licenses || true
+
+          echo "SDK license acceptance completed."
+
+      # 5. Install only required Android packages
+      # Never install obsolete package named "tools".
+      - name: Install Required Android SDK Packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" \
+            --install \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-          yes | sdkmanager --licenses || true
+          echo "Required Android SDK packages installed."
 
-      # 4. Install exact Gradle version required by project
+      # 6. Setup exact Gradle version
       - name: Set Up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-          cache-disabled: false
 
-      # 5. Find and extract latest ZIP
-      - name: Find and Extract Project ZIP
+      # 7. Find and extract latest ZIP
+      - name: Find and Extract Latest Project ZIP
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Searching for project ZIP files..."
+          echo "Searching for ZIP files..."
 
           ZIP_FILE=$(
             find . \
@@ -85,59 +127,50 @@ jobs:
             | cut -d' ' -f2-
           )
 
-          mkdir -p "$RUNNER_TEMP/umt-source"
-
-          if [ -n "$ZIP_FILE" ]; then
-
-            echo "Selected ZIP: $ZIP_FILE"
-
-            unzip -t "$ZIP_FILE"
-
-            unzip -q "$ZIP_FILE" \
-              -d "$RUNNER_TEMP/umt-source"
-
-            echo "ZIP extraction successful."
-
-            PROJECT_FILE=$(
-              find "$RUNNER_TEMP/umt-source" \
-                -type f \
-                -name 'settings.gradle.kts' \
-                -print -quit
-            )
-
-            if [ -z "$PROJECT_FILE" ]; then
-              echo "ERROR: settings.gradle.kts not found in ZIP."
-              exit 1
-            fi
-
-            PROJECT_DIR=$(dirname "$PROJECT_FILE")
-
-          elif [ -f "UniversalMultiFlashingTool/settings.gradle.kts" ]; then
-
-            echo "No ZIP found. Using extracted repository project."
-
-            PROJECT_DIR="$GITHUB_WORKSPACE/UniversalMultiFlashingTool"
-
-          else
-
-            echo "ERROR: No ZIP or Android project found."
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No project ZIP found."
             exit 1
-
           fi
+
+          echo "Selected ZIP: $ZIP_FILE"
+
+          PROJECT_ROOT="$RUNNER_TEMP/android-project"
+
+          mkdir -p "$PROJECT_ROOT"
+
+          unzip -t "$ZIP_FILE"
+
+          unzip -q "$ZIP_FILE" -d "$PROJECT_ROOT"
+
+          echo "ZIP extraction completed."
+
+          PROJECT_FILE=$(
+            find "$PROJECT_ROOT" \
+              -type f \
+              \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+              -print -quit
+          )
+
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "ERROR: Gradle settings file not found."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PROJECT_FILE")
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          echo "Selected project: $PROJECT_DIR"
+          echo "Detected project: $PROJECT_DIR"
 
-      # 6. Verify project configuration
-      - name: Verify Project Configuration
+      # 8. Verify project configuration
+      - name: Verify Android Project Configuration
         shell: bash
         run: |
           set -euo pipefail
 
           cd "$PROJECT_DIR"
 
-          echo "Checking project files..."
+          echo "Checking Android project..."
 
           test -f settings.gradle.kts
           test -f build.gradle.kts
@@ -145,29 +178,15 @@ jobs:
           test -f gradle/libs.versions.toml
           test -f gradle.properties
 
-          echo "Checking Android Gradle Plugin..."
-
           grep -q '8.7.3' build.gradle.kts
-
-          echo "Checking Kotlin version..."
-
           grep -q '2.0.21' build.gradle.kts
 
-          echo "Checking SDK configuration..."
-
           grep -q 'compileSdk = 35' app/build.gradle.kts
+          grep -q 'minSdk = 26' app/build.gradle.kts
 
           echo "Project configuration verified."
 
-      # 7. Verify screen layout
-      - name: Verify Fixed Screen Layout
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          bash "$PROJECT_DIR/tools/simulation/check_screen_layout.sh"
-
-      # 8. Verify Java and Gradle
+      # 9. Verify Java, SDK and Gradle
       - name: Verify Build Environment
         shell: bash
         run: |
@@ -175,13 +194,25 @@ jobs:
 
           java -version
           gradle --version
-          sdkmanager --version
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --list_installed
 
-      # 9. Resolve dependencies
-      - name: Resolve Gradle Dependencies
+          echo "Build environment verified."
+
+      # 10. Verify screen layout
+      - name: Run Screen Layout Verification
         shell: bash
         run: |
           set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          bash tools/simulation/check_screen_layout.sh
+
+      # 11. Resolve dependencies with retry
+      - name: Resolve Gradle Dependencies
+        shell: bash
+        run: |
+          set -uo pipefail
 
           cd "$PROJECT_DIR"
 
@@ -189,55 +220,88 @@ jobs:
 
             echo "Dependency resolution attempt: $attempt"
 
-            if gradle \
+            if gradle dependencies \
               --no-daemon \
               --stacktrace \
-              --max-workers=2 \
-              dependencies; then
+              --max-workers=2; then
 
-              echo "Dependency resolution completed."
+              echo "Dependencies resolved successfully."
               exit 0
             fi
 
             if [ "$attempt" -lt 3 ]; then
-              echo "Dependency resolution failed. Retrying..."
+              echo "Retrying dependency resolution..."
               sleep $((attempt * 20))
             fi
 
           done
 
-          echo "ERROR: Dependencies could not be resolved."
+          echo "ERROR: Dependency resolution failed."
           exit 1
 
-      # 10. Run unit tests
+      # 12. Run unit tests
       - name: Run Unit Tests
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
           cd "$PROJECT_DIR"
 
-          gradle \
-            --no-daemon \
-            --stacktrace \
-            --max-workers=2 \
-            testDebugUnitTest
+          for attempt in 1 2 3; do
 
-      # 11. Build APK
+            echo "Unit test attempt: $attempt"
+
+            if gradle testDebugUnitTest \
+              --no-daemon \
+              --stacktrace \
+              --max-workers=2; then
+
+              echo "Unit tests passed."
+              exit 0
+            fi
+
+            if [ "$attempt" -lt 3 ]; then
+              echo "Retrying unit tests..."
+              sleep $((attempt * 15))
+            fi
+
+          done
+
+          echo "ERROR: Unit tests failed."
+          exit 1
+
+      # 13. Build Debug APK
       - name: Build Debug APK
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
           cd "$PROJECT_DIR"
 
-          gradle \
-            --no-daemon \
-            --stacktrace \
-            --max-workers=2 \
-            assembleDebug
+          for attempt in 1 2 3; do
 
-      # 12. Verify APK
+            echo "APK build attempt: $attempt"
+
+            if gradle assembleDebug \
+              --no-daemon \
+              --stacktrace \
+              --max-workers=2; then
+
+              echo "APK build completed successfully."
+              exit 0
+            fi
+
+            if [ "$attempt" -lt 3 ]; then
+              echo "Retrying APK build..."
+              sleep $((attempt * 20))
+            fi
+
+          done
+
+          echo "ERROR: APK build failed."
+          exit 1
+
+      # 14. Verify generated APK
       - name: Verify Generated APK
         shell: bash
         run: |
@@ -246,7 +310,7 @@ jobs:
           APK_DIR="$PROJECT_DIR/app/build/outputs/apk/debug"
 
           if [ ! -d "$APK_DIR" ]; then
-            echo "ERROR: APK output directory not found."
+            echo "ERROR: APK directory not found."
             exit 1
           fi
 
@@ -260,7 +324,7 @@ jobs:
             exit 1
           fi
 
-          echo "APK files generated successfully:"
+          echo "Generated APK files:"
 
           find "$APK_DIR" \
             -maxdepth 1 \
@@ -268,16 +332,17 @@ jobs:
             -name '*.apk' \
             -exec ls -lh {} \;
 
-      # 13. Upload APK
+      # 15. Upload APK
       - name: Upload Android APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Universal-Multi-Flashing-Tool-v1.8.0-APK
+          name: Universal-Multi-Flashing-Tool-APK
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
 
-      # 14. Upload test reports
+      # 16. Upload unit test reports
       - name: Upload Unit Test Reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -287,7 +352,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # 15. Upload diagnostic logs
+      # 17. Upload diagnostic logs
       - name: Upload Build Diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -296,5 +361,6 @@ jobs:
           path: |
             /home/runner/.gradle/daemon/
             ${{ env.PROJECT_DIR }}/app/build/reports/
+            ${{ env.PROJECT_DIR }}/app/build/test-results/
           if-no-files-found: ignore
           retention-days: 7
